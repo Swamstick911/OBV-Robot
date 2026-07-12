@@ -75,10 +75,11 @@ OBV-Robot/
 
 ## 🗺️ Roadmap
 
-- [ ] Upgraded firmware: non-blocking 3-mode + telemetry
-- [ ] Flutter app: Bluetooth connection + live radar
-- [ ] Manual, Voice, and Auto mode UIs
-- [ ] "Sonar HUD" theme polish
+- [x] Upgraded firmware: non-blocking 3-mode + telemetry
+- [x] Flutter app: Bluetooth connection + live radar
+- [x] Manual, Voice, and Auto mode UIs
+- [x] "Sonar HUD" theme
+- [ ] On-device testing with the robot
 - [ ] Untethered power fix (buck converter)
 
 ## 📝 Notes
