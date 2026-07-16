@@ -65,7 +65,16 @@ unsigned long lastSweepTime = 0;
 const int OBSTACLE_CM = 30;          // stop when something is this close ahead
 const unsigned long TURN_MS = 550;   // how long to pivot when avoiding
 const unsigned long SETTLE_MS = 220; // let the servo settle before a side reading
-const unsigned long AUTO_READ_INTERVAL = 60;
+
+// While driving, AUTO gently scans a forward arc (not a single point), so the
+// robot senses distance across the near-front and the radar shows a real arc.
+const int FSCAN_MIN = 60;
+const int FSCAN_MAX = 120;
+const int FSCAN_STEP = 15;
+const unsigned long FSCAN_INTERVAL = 70; // pace: lets the servo settle between reads
+int fscanAngle = 90;
+int fscanDir = 1;
+
 enum AutoState { A_DRIVE, A_BRAKE, A_LOOK_L, A_LOOK_R, A_TURN };
 AutoState aState = A_DRIVE;
 unsigned long aTimer = 0;
@@ -106,6 +115,7 @@ void handleSerial() {
     if (c == 'T') {                       // enter auto mode
       mode = AUTO;
       aState = A_DRIVE;
+      fscanAngle = 90;
       lastAutoRead = 0;
     } else if (c >= '0' && c <= '9') {    // set speed (any mode)
       currentSpeed = map(c - '0', 0, 9, 0, 255);
@@ -146,24 +156,28 @@ void updateSweep() {
 }
 
 // ===============================
-// AUTO: eyes-forward avoidance
+// AUTO: forward-arc scanning avoidance
 // ===============================
 void autoStep() {
   unsigned long now = millis();
 
   switch (aState) {
     case A_DRIVE:
-      pointServo(90);                              // hold forward
-      if (now - lastAutoRead >= AUTO_READ_INTERVAL) {
+      if (now - lastAutoRead >= FSCAN_INTERVAL) {
         lastAutoRead = now;
-        int d = readDistanceMedian();              // accurate front reading
-        streamTelemetry(90, d);
-        if (d <= OBSTACLE_CM) {                    // obstacle ahead
+        int d = readDistanceMedian();              // clean reading at current angle
+        streamTelemetry(fscanAngle, d);            // radar shows the forward arc
+        if (d <= OBSTACLE_CM) {                    // obstacle anywhere in the arc
           stopAll();
           aTimer = now + 150;
           aState = A_BRAKE;
           return;
         }
+        // step the sensor across the forward arc for the next read
+        fscanAngle += fscanDir * FSCAN_STEP;
+        if (fscanAngle >= FSCAN_MAX) { fscanAngle = FSCAN_MAX; fscanDir = -1; }
+        if (fscanAngle <= FSCAN_MIN) { fscanAngle = FSCAN_MIN; fscanDir =  1; }
+        pointServo(fscanAngle);
       }
       moveForward();
       break;
@@ -201,6 +215,9 @@ void autoStep() {
     case A_TURN:
       if (now >= aTimer) {
         stopAll();
+        fscanAngle = 90;              // re-center the forward scan
+        fscanDir = 1;
+        lastAutoRead = 0;            // read again immediately
         aState = A_DRIVE;
       }
       break;
