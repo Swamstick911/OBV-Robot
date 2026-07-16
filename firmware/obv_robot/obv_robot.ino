@@ -1,13 +1,19 @@
 /*
- * OBV Robot — firmware
- * ---------------------
+ * OBV Robot — firmware (v2)
+ * -------------------------
  * Object-aVoidance robot with three control modes:
- *   - MANUAL : driven by single-character commands over Bluetooth (HC-05)
+ *   - MANUAL : single-character drive commands over Bluetooth (HC-05)
+ *   - VOICE  : same commands, sent by the phone's speech recognition
  *   - AUTO   : autonomous obstacle avoidance
- *   - (voice mode lives in the app; it just sends the same MANUAL commands)
  *
- * The servo sweeps the ultrasonic sensor continuously in ALL modes and
- * streams telemetry so the app can draw a live radar.
+ * Telemetry is streamed so the app can draw a live radar.
+ *
+ * v2 change — reliable AUTO mode:
+ *   In MANUAL/VOICE the servo sweeps continuously (nice radar). But a
+ *   constantly-sweeping sensor is aimed forward only briefly, so it misses
+ *   obstacles dead ahead. So in AUTO the servo now HOLDS FORWARD (90 deg) and
+ *   watches continuously; it only glances left/right to pick a turn direction
+ *   once an obstacle is found. Distances are median-filtered to reject noise.
  *
  * Command protocol (app -> Arduino), one ASCII char each:
  *   F / U : forward        B / D : backward
@@ -16,11 +22,8 @@
  *   T     : enter AUTO (obstacle-avoidance) mode
  *   0..9  : set speed (mapped to 0..255)
  *
- * Telemetry (Arduino -> app), one line per reading, newline-terminated:
+ * Telemetry (Arduino -> app), one line per reading:
  *   A<angle>D<distance>\n     e.g.  A90D42
- *
- * Design note: the loop is NON-BLOCKING (no long delay() chains). Incoming
- * commands are checked on every pass, so mode-switch / stop respond instantly.
  */
 
 #include <AFMotor.h>
@@ -40,60 +43,57 @@ AF_DCMotor motor4(4);
 #define trigPin A1
 #define echoPin A2
 Servo scanServo;
+int servoPos = 90; // last commanded servo angle
 
 // ===============================
 // STATE
 // ===============================
 enum Mode { MANUAL, AUTO };
 Mode mode = MANUAL;
+int currentSpeed = 200; // 0..255, set via '0'..'9'
 
-int currentSpeed = 200;              // 0..255, set via '0'..'9'
-
-// Servo sweep (non-blocking)
-const int SWEEP_MIN  = 30;
-const int SWEEP_MAX  = 150;
+// Continuous sweep — MANUAL/VOICE only (for the radar)
+const int SWEEP_MIN = 30;
+const int SWEEP_MAX = 150;
 const int SWEEP_STEP = 6;
-const unsigned long SWEEP_INTERVAL = 50;   // ms between steps
+const unsigned long SWEEP_INTERVAL = 60;
 int sweepAngle = 90;
-int sweepDir   = 1;                          // +1 / -1
+int sweepDir = 1;
 unsigned long lastSweepTime = 0;
 
-// Latest distance per sector (cm), updated as the sweep passes through
-int frontDistance = 300;
-int leftDistance  = 300;
-int rightDistance = 300;
-
-// Auto-mode obstacle avoidance
-const int OBSTACLE_CM = 30;
-enum AutoState { DRIVING, TURNING };
-AutoState autoState = DRIVING;
-unsigned long autoTurnUntil = 0;
-const unsigned long TURN_MS = 600;
+// AUTO obstacle avoidance (non-blocking state machine)
+const int OBSTACLE_CM = 30;          // stop when something is this close ahead
+const unsigned long TURN_MS = 550;   // how long to pivot when avoiding
+const unsigned long SETTLE_MS = 220; // let the servo settle before a side reading
+const unsigned long AUTO_READ_INTERVAL = 60;
+enum AutoState { A_DRIVE, A_BRAKE, A_LOOK_L, A_LOOK_R, A_TURN };
+AutoState aState = A_DRIVE;
+unsigned long aTimer = 0;
+unsigned long lastAutoRead = 0;
+int aLeft = 300, aRight = 300;
 
 // ===============================
 // SETUP
 // ===============================
 void setup() {
   Serial.begin(9600);
-
   pinMode(trigPin, OUTPUT);
   pinMode(echoPin, INPUT);
-
   scanServo.attach(9);
-  scanServo.write(sweepAngle);
-
+  pointServo(90);
   setAllSpeed(currentSpeed);
   stopAll();
 }
 
 // ===============================
-// LOOP  (non-blocking)
+// LOOP
 // ===============================
 void loop() {
-  handleSerial();     // 1. always respond to commands first
-  updateSweep();      // 2. sweep servo + stream telemetry on a timer
-  if (mode == AUTO) { // 3. run the active mode
-    autoStep();
+  handleSerial();               // always respond to commands first
+  if (mode == AUTO) {
+    autoStep();                 // AUTO drives the servo + reads itself
+  } else {
+    updateSweep();              // MANUAL/VOICE: continuous radar sweep
   }
 }
 
@@ -103,10 +103,10 @@ void loop() {
 void handleSerial() {
   while (Serial.available()) {
     char c = Serial.read();
-
     if (c == 'T') {                       // enter auto mode
       mode = AUTO;
-      autoState = DRIVING;
+      aState = A_DRIVE;
+      lastAutoRead = 0;
     } else if (c >= '0' && c <= '9') {    // set speed (any mode)
       currentSpeed = map(c - '0', 0, 9, 0, 255);
       setAllSpeed(currentSpeed);
@@ -124,44 +124,113 @@ void applyManual(char c) {
     case 'L':           pivotTurnLeft();  break;
     case 'R':           pivotTurnRight(); break;
     case 'S':           stopAll();        break;
-    default: /* ignore unknown */         break;
+    default: /* ignore */                 break;
   }
 }
 
 // ===============================
-// SWEEP + TELEMETRY
+// MANUAL/VOICE: continuous radar sweep
 // ===============================
 void updateSweep() {
   unsigned long now = millis();
   if (now - lastSweepTime < SWEEP_INTERVAL) return;
   lastSweepTime = now;
 
-  // The servo has been at sweepAngle since last tick, so it has settled.
-  int d = readDistance();
+  int d = pingCm();             // single fast ping is fine for the radar
   streamTelemetry(sweepAngle, d);
 
-  // Store into the matching sector for the auto-mode logic.
-  if (sweepAngle < 75)       rightDistance = d;
-  else if (sweepAngle > 105) leftDistance  = d;
-  else                       frontDistance = d;
-
-  // Advance the servo for the next tick.
   sweepAngle += sweepDir * SWEEP_STEP;
   if (sweepAngle >= SWEEP_MAX) { sweepAngle = SWEEP_MAX; sweepDir = -1; }
   if (sweepAngle <= SWEEP_MIN) { sweepAngle = SWEEP_MIN; sweepDir =  1; }
-  scanServo.write(sweepAngle);
+  pointServo(sweepAngle);
 }
 
-int readDistance() {
+// ===============================
+// AUTO: eyes-forward avoidance
+// ===============================
+void autoStep() {
+  unsigned long now = millis();
+
+  switch (aState) {
+    case A_DRIVE:
+      pointServo(90);                              // hold forward
+      if (now - lastAutoRead >= AUTO_READ_INTERVAL) {
+        lastAutoRead = now;
+        int d = readDistanceMedian();              // accurate front reading
+        streamTelemetry(90, d);
+        if (d <= OBSTACLE_CM) {                    // obstacle ahead
+          stopAll();
+          aTimer = now + 150;
+          aState = A_BRAKE;
+          return;
+        }
+      }
+      moveForward();
+      break;
+
+    case A_BRAKE:                                  // pause, then look left
+      if (now >= aTimer) {
+        pointServo(150);
+        aTimer = now + SETTLE_MS;
+        aState = A_LOOK_L;
+      }
+      break;
+
+    case A_LOOK_L:
+      if (now >= aTimer) {
+        aLeft = readDistanceMedian();
+        streamTelemetry(150, aLeft);
+        pointServo(30);                            // now look right
+        aTimer = now + SETTLE_MS;
+        aState = A_LOOK_R;
+      }
+      break;
+
+    case A_LOOK_R:
+      if (now >= aTimer) {
+        aRight = readDistanceMedian();
+        streamTelemetry(30, aRight);
+        pointServo(90);                            // face forward for the turn
+        if (aLeft >= aRight) pivotTurnLeft();      // turn toward the open side
+        else                 pivotTurnRight();
+        aTimer = now + TURN_MS;
+        aState = A_TURN;
+      }
+      break;
+
+    case A_TURN:
+      if (now >= aTimer) {
+        stopAll();
+        aState = A_DRIVE;
+      }
+      break;
+  }
+}
+
+// ===============================
+// DISTANCE
+// ===============================
+// Median of 3 pings — rejects the occasional noisy/inflated reading.
+int readDistanceMedian() {
+  int a = pingCm(); delay(8);
+  int b = pingCm(); delay(8);
+  int c = pingCm();
+  if (a > b) { int t = a; a = b; b = t; }
+  if (b > c) { int t = b; b = c; c = t; }
+  if (a > b) { int t = a; a = b; b = t; }
+  return b;
+}
+
+int pingCm() {
   digitalWrite(trigPin, LOW);
   delayMicroseconds(2);
   digitalWrite(trigPin, HIGH);
   delayMicroseconds(10);
   digitalWrite(trigPin, LOW);
 
-  long duration = pulseIn(echoPin, HIGH, 20000);   // ~3.4 m timeout
-  if (duration == 0) return 300;                    // no echo -> treat as far
-  return (int)(duration * 0.034 / 2);
+  unsigned long duration = pulseIn(echoPin, HIGH, 12000UL); // ~2 m timeout
+  if (duration == 0) return 300;                             // no echo -> far
+  return (int)(duration * 0.0343 / 2.0);
 }
 
 void streamTelemetry(int angle, int distance) {
@@ -171,32 +240,10 @@ void streamTelemetry(int angle, int distance) {
   Serial.println(distance);
 }
 
-// ===============================
-// AUTO MODE (non-blocking state machine)
-// ===============================
-void autoStep() {
-  unsigned long now = millis();
-
-  switch (autoState) {
-    case DRIVING:
-      if (frontDistance <= OBSTACLE_CM) {
-        stopAll();
-        // Turn toward whichever side is more open.
-        if (leftDistance >= rightDistance) pivotTurnLeft();
-        else                               pivotTurnRight();
-        autoTurnUntil = now + TURN_MS;
-        autoState = TURNING;
-      } else {
-        moveForward();
-      }
-      break;
-
-    case TURNING:
-      if (now >= autoTurnUntil) {
-        stopAll();
-        autoState = DRIVING;
-      }
-      break;
+void pointServo(int a) {
+  if (a != servoPos) {
+    scanServo.write(a);
+    servoPos = a;
   }
 }
 
@@ -221,7 +268,6 @@ void moveBackward() {
 
 void pivotTurnLeft() {
   setAllSpeed(currentSpeed);
-  // Right side forward, left side backward -> rotate left in place.
   motor1.run(FORWARD);
   motor4.run(FORWARD);
   motor2.run(BACKWARD);
@@ -230,7 +276,6 @@ void pivotTurnLeft() {
 
 void pivotTurnRight() {
   setAllSpeed(currentSpeed);
-  // Right side backward, left side forward -> rotate right in place.
   motor1.run(BACKWARD);
   motor4.run(BACKWARD);
   motor2.run(FORWARD);
