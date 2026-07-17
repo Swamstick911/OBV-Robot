@@ -102,7 +102,7 @@ void loop() {
   if (mode == AUTO) {
     autoStep();                 // AUTO drives the servo + reads itself
   } else {
-    updateSweep();              // MANUAL/VOICE: continuous radar sweep
+    manualIdle();               // MANUAL/VOICE: park servo (saves power) + slow read
   }
 }
 
@@ -139,20 +139,18 @@ void applyManual(char c) {
 }
 
 // ===============================
-// MANUAL/VOICE: continuous radar sweep
+// MANUAL/VOICE: park the sensor forward (no sweeping) to save power
 // ===============================
-void updateSweep() {
+// Constantly sweeping the servo is a heavy load on the 5V rail, which steals
+// headroom the motors need. In manual/voice we park it at 90 deg and take a
+// slow forward reading just for the distance readout — no repeated servo moves.
+void manualIdle() {
+  pointServo(90);                       // hold forward once; no sweeping
   unsigned long now = millis();
-  if (now - lastSweepTime < SWEEP_INTERVAL) return;
-  lastSweepTime = now;
-
-  int d = pingCm();             // single fast ping is fine for the radar
-  streamTelemetry(sweepAngle, d);
-
-  sweepAngle += sweepDir * SWEEP_STEP;
-  if (sweepAngle >= SWEEP_MAX) { sweepAngle = SWEEP_MAX; sweepDir = -1; }
-  if (sweepAngle <= SWEEP_MIN) { sweepAngle = SWEEP_MIN; sweepDir =  1; }
-  pointServo(sweepAngle);
+  if (now - lastSweepTime >= 200) {
+    lastSweepTime = now;
+    streamTelemetry(90, pingCm());      // single low-power front reading
+  }
 }
 
 // ===============================
